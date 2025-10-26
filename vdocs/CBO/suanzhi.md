@@ -407,7 +407,261 @@ sequenceDiagram
 
 ## **6. 总结**
 
-DuckDB 通过其先进的优化器架构和向量化执行引擎，实现了卓越的分析型查询性能：
+DuckDB 通过其先进的优化器架构、向量化执行引擎和Pipeline并行系统，实现了卓越的分析型查询性能。
+
+---
+
+## **7. Pipeline系统详细分析**
+
+DuckDB的Pipeline系统是其高性能并行执行的核心，采用推模式执行和多层次并行策略。
+
+### **7.1 Pipeline系统架构**
+
+```mermaid
+graph TB
+    subgraph "**Pipeline系统架构**"
+        A["**Executor**<br/>**查询执行器**<br/>• 管理执行状态<br/>• 协调Pipeline<br/>• 错误处理"]
+        
+        A --> B["**MetaPipeline**<br/>**元Pipeline管理器**<br/>• 管理Pipeline集合<br/>• 依赖关系处理<br/>• 递归CTE支持"]
+        
+        B --> C["**Pipeline**<br/>**执行流水线**<br/>• Source + Operators + Sink<br/>• 并行策略决策<br/>• 进度跟踪"]
+        
+        C --> D["**PipelineExecutor**<br/>**Pipeline执行器**<br/>• 推模式执行<br/>• 数据流控制<br/>• 异常处理"]
+        
+        D --> E["**TaskScheduler**<br/>**任务调度器**<br/>• 并发队列管理<br/>• 线程池调度<br/>• 任务生命周期"]
+        
+        E --> F["**ExecutorTask**<br/>**执行器任务**<br/>• 具体执行单元<br/>• 状态管理<br/>• 结果收集"]
+        
+        F --> G["**Event System**<br/>**事件系统**<br/>• 任务同步<br/>• 依赖协调<br/>• 完成通知"]
+        
+        A --> H["**PhysicalOperator**<br/>**物理算子**<br/>• Source算子<br/>• 中间算子<br/>• Sink算子"]
+    end
+    
+    style A fill:#e3f2fd,stroke:#1976d2,stroke-width:3px
+    style B fill:#f3e5f5,stroke:#7b1fa2,stroke-width:2px
+    style C fill:#fff3e0,stroke:#f57c00,stroke-width:2px
+    style D fill:#e8f5e8,stroke:#388e3c,stroke-width:2px
+    style E fill:#fce4ec,stroke:#c2185b,stroke-width:2px
+    style F fill:#f1f8e9,stroke:#689f38,stroke-width:2px
+    style G fill:#fff8e1,stroke:#ffa000,stroke-width:2px
+    style H fill:#e0f2f1,stroke:#00695c,stroke-width:2px
+```
+
+### **7.2 Pipeline执行流程**
+
+```mermaid
+sequenceDiagram
+    participant Executor as **Executor**<br/>**执行器**
+    participant MetaPipeline as **MetaPipeline**<br/>**元Pipeline**
+    participant Pipeline as **Pipeline**<br/>**流水线**
+    participant Scheduler as **TaskScheduler**<br/>**任务调度器**
+    participant Task as **PipelineTask**<br/>**Pipeline任务**
+    participant PipelineExec as **PipelineExecutor**<br/>**Pipeline执行器**
+    participant Operator as **PhysicalOperator**<br/>**物理算子**
+    
+    Executor->>MetaPipeline: **构建执行计划**
+    Note right of MetaPipeline: 分析依赖关系<br/>创建Pipeline树
+    
+    MetaPipeline->>Pipeline: **创建Pipeline**
+    Note right of Pipeline: 确定并行策略<br/>设置Source和Sink
+    
+    Pipeline->>Scheduler: **调度任务**
+    Note right of Scheduler: 评估并行度<br/>创建任务队列
+    
+    loop **并行执行循环**
+        Scheduler->>Task: **分发任务**
+        Task->>PipelineExec: **执行Pipeline**
+        
+        loop **数据处理循环**
+            PipelineExec->>Operator: **Source.GetChunk()**
+            Operator-->>PipelineExec: **DataChunk**
+            
+            PipelineExec->>Operator: **Operator.Execute()**
+            Note right of Operator: 向量化处理<br/>1024行批量计算
+            Operator-->>PipelineExec: **处理结果**
+            
+            PipelineExec->>Operator: **Sink.Consume()**
+            Note right of Operator: 数据推送<br/>结果收集
+        end
+        
+        Task-->>Scheduler: **任务完成**
+    end
+    
+    Scheduler-->>Executor: **执行完成**
+```
+
+### **7.3 核心组件源码分析**
+
+#### **TaskScheduler - 任务调度器**
+**源码位置**: `src/parallel/task_scheduler.cpp`
+
+**核心特性**:
+- **并发队列**: 使用`duckdb_moodycamel::ConcurrentQueue`实现无锁任务队列
+- **ProducerToken**: 每个生产者获得独立的令牌，避免竞争
+- **LightweightSemaphore**: 高效的信号量机制，支持超时等待
+- **动态线程管理**: 根据系统资源动态调整工作线程数量
+
+**关键方法**:
+```cpp
+// 调度任务到队列
+void ScheduleTask(ProducerToken &producer, shared_ptr<Task> task);
+
+// 从生产者获取任务
+bool GetTaskFromProducer(ProducerToken &token, shared_ptr<Task> &task);
+
+// 执行任务直到完成或中断
+idx_t ExecuteTasks(atomic<bool> *marker, idx_t max_tasks);
+```
+
+#### **PipelineExecutor - 流水线执行器**
+**源码位置**: `src/parallel/pipeline_executor.cpp`
+
+**执行模式**: 推模式（Push-based）执行
+- **数据流向**: Source → Operators → Sink
+- **批量处理**: 1024行DataChunk为基本处理单元
+- **中断支持**: 支持查询取消和优雅中断
+- **异常处理**: 完整的错误传播和恢复机制
+
+**执行循环**:
+```cpp
+PipelineExecuteResult Execute(idx_t max_batches) {
+    while (max_batches > 0) {
+        // 从Source获取数据
+        source->GetData(context, chunk);
+        
+        // 通过算子链处理数据
+        ExecuteInternal(chunk, final_chunk);
+        
+        // 推送到Sink
+        sink->Sink(context, final_chunk, *sink_state);
+        
+        max_batches--;
+    }
+}
+```
+
+#### **MetaPipeline - 元Pipeline管理器**
+**源码位置**: `src/parallel/meta_pipeline.cpp`
+
+**管理功能**:
+- **Pipeline组织**: 管理多个相关Pipeline的执行顺序
+- **依赖处理**: 处理Pipeline之间的数据依赖关系
+- **递归CTE**: 特殊处理递归公用表表达式
+- **批次索引**: 管理并行扫描的批次分配
+
+---
+
+## **8. SIMD优化实现深度分析**
+
+DuckDB在向量化执行中广泛使用SIMD优化，提高CPU并行计算能力。
+
+### **8.1 SIMD包装架构**
+
+```mermaid
+graph TB
+    subgraph "**SIMD优化架构**"
+        A["**VectorOperations**<br/>**向量操作接口**<br/>• 统一向量操作API<br/>• 类型安全封装<br/>• NULL值处理"]
+        
+        A --> B["**UnaryExecutor**<br/>**一元操作执行器**<br/>• 模板化执行<br/>• __restrict优化<br/>• 分支优化"]
+        
+        A --> C["**BinaryExecutor**<br/>**二元操作执行器**<br/>• 双向量操作<br/>• 内存对齐<br/>• 循环展开"]
+        
+        B --> D["**ArrayKernels**<br/>**数组计算内核**<br/>• 数学运算<br/>• 距离计算<br/>• 相似度计算"]
+        
+        C --> D
+        
+        D --> E["**SIMD指令**<br/>**底层优化**<br/>• SSE/AVX指令<br/>• 向量化循环<br/>• 内存预取"]
+        
+        A --> F["**SelectionVector**<br/>**选择向量优化**<br/>• 条件过滤<br/>• 稀疏数据处理<br/>• 分支消除"]
+    end
+    
+    style A fill:#e3f2fd,stroke:#1976d2,stroke-width:3px
+    style B fill:#f3e5f5,stroke:#7b1fa2,stroke-width:2px
+    style C fill:#fff3e0,stroke:#f57c00,stroke-width:2px
+    style D fill:#e8f5e8,stroke:#388e3c,stroke-width:2px
+    style E fill:#fce4ec,stroke:#c2185b,stroke-width:2px
+    style F fill:#f1f8e9,stroke:#689f38,stroke-width:2px
+```
+
+### **8.2 SIMD操作实现分析**
+
+#### **VectorOperations - 向量操作**
+**源码位置**: `src/common/vector_operations/`
+
+**支持的SIMD操作**:
+- **算术运算**: 加减乘除，批量计算数值表达式
+- **比较操作**: 等于、大于、小于等条件判断
+- **逻辑运算**: AND、OR、NOT等布尔运算
+- **聚合函数**: SUM、COUNT、MIN、MAX等聚合计算
+- **字符串操作**: 模式匹配、字符串比较等
+
+#### **UnaryExecutor模板**
+**源码位置**: `src/include/duckdb/common/vector_operations/unary_executor.hpp`
+
+**优化技术**:
+```cpp
+template <class INPUT_TYPE, class RESULT_TYPE, class OPWRAPPER, class OP>
+static inline void ExecuteLoop(
+    const INPUT_TYPE *__restrict ldata,    // restrict指针优化
+    RESULT_TYPE *__restrict result_data,   // 避免内存别名
+    idx_t count,                           // 批量处理数量
+    const SelectionVector *__restrict sel_vector,
+    ValidityMask &mask                     // NULL值处理
+) {
+    // 优化的执行循环，支持SIMD指令
+    for (idx_t i = 0; i < count; i++) {
+        auto idx = sel_vector->get_index(i);
+        result_data[i] = OP::Operation(ldata[idx]);
+    }
+}
+```
+
+#### **数组计算内核**
+**源码位置**: `extension/core_functions/include/core_functions/array_kernels.hpp`
+
+**专门的SIMD优化算法**:
+- **内积计算**: 向量点积运算，使用SIMD加速
+- **余弦相似度**: 向量相似度计算
+- **欧氏距离**: 空间距离计算
+- **向量运算**: 专门针对机器学习和分析的向量运算
+
+```cpp
+struct InnerProductOp {
+    template <class TYPE>
+    static TYPE Operation(const TYPE *lhs_data, const TYPE *rhs_data, const idx_t count) {
+        TYPE result = 0;
+        // 编译器自动向量化优化
+        for (idx_t i = 0; i < count; i++) {
+            result += lhs_data[i] * rhs_data[i];
+        }
+        return result;
+    }
+};
+```
+
+#### **FSST压缩中的SIMD应用**
+**源码位置**: `third_party/fsst/libfsst.hpp`
+
+**SIMD缓冲区优化**:
+- **SIMD缓冲区**: 768KB专门的SIMD字符串处理区域
+- **SIMDjob结构**: 64位SIMD lane的任务控制
+- **批量压缩**: 支持SIMD指令的字符串压缩算法
+
+### **8.3 性能优化策略**
+
+**编译器优化**:
+- **循环向量化**: 编译器自动将循环转换为SIMD指令
+- **内存对齐**: 确保数据按SIMD要求对齐访问
+- **分支消除**: 减少条件分支，提高指令流水线效率
+
+**手工优化**:
+- **__restrict关键字**: 告知编译器指针不重叠，启用更激进的优化
+- **模板特化**: 针对不同数据类型的专门优化
+- **批量处理**: 1024行的标准批大小，最大化SIMD效益
+
+---
+
+## **9. 总结**
 
 ### **架构优势**
 1. **模块化设计**: 清晰的模块分离，易于维护和扩展
